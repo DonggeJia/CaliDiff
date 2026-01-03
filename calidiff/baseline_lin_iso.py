@@ -1,0 +1,401 @@
+import os
+import json
+import glob
+
+import numpy as np
+from fipy import CellVariable, Grid2D, TransientTerm, DiffusionTerm
+from fipy.tools import numerix
+
+# ============================================================
+# Basic constants (consistent with your linear-isotropic setup)
+# ============================================================
+
+DAY_SEC = 24.0 * 3600.0
+MM_TO_M = 1e-3
+
+# Match your generator settings
+D28x = 1e-12       # [m^2/s]
+N_POLY = 2.0       # exponent in D(φ) = D28 * (1 + 5000 a φ^N_POLY)
+
+
+# ============================================================
+# 1. Isotropic diffusion PDE (same as ML setup)
+# ============================================================
+
+def simulate_final_phi_isotropic(params, a_steps, nx=64, ny=64):
+    """
+    Re-run the *same* isotropic diffusion PDE you used for data generation,
+    but with a *given* stair-step a(t) instead of random sampling.
+
+    params: dict loaded from params.json
+      must contain width_mm, height_mm, c_boundary, c_init, c_other, time_days
+    a_steps: 1D array-like of length K (N_COEFF_STEPS), isotropic scalar a_k
+    """
+    width_mm   = params["width_mm"]
+    height_mm  = params["height_mm"]
+    c_boundary = params["c_boundary"]
+    c_init     = params["c_init"]
+    c_other    = params["c_other"]
+    time_days  = params["time_days"]
+
+    a_steps = np.asarray(a_steps, dtype=float)
+    num_steps = len(a_steps)
+
+    # --- Mesh ---
+    Lx = width_mm * MM_TO_M
+    Ly = height_mm * MM_TO_M
+
+    dx = Lx / nx
+    dy = Ly / ny
+
+    mesh = Grid2D(dx=dx, dy=dy, nx=nx, ny=ny)
+
+    # --- Variable: concentration φ ---
+    phi = CellVariable(
+        name="concentration",
+        mesh=mesh,
+        value=c_init,
+        hasOld=1,
+    )
+
+    # --- Boundary conditions ---
+    X, Y = mesh.faceCenters
+    exterior_faces = mesh.exteriorFaces
+
+    y_min = (height_mm / 4.0) * MM_TO_M
+    y_max = (3.0 * height_mm / 4.0) * MM_TO_M
+
+    exposed_faces = mesh.facesLeft & (Y >= y_min) & (Y <= y_max)
+    other_boundary_faces = exterior_faces & (~exposed_faces)
+
+    phi.constrain(c_boundary, exposed_faces)
+    phi.constrain(c_other, other_boundary_faces)
+
+    # --- Time-stepping ---
+    t = 0.0
+    t_final = float(time_days) * DAY_SEC
+
+    # Use len(a_steps) as N_COEFF_STEPS to avoid hard-coding
+    t_edges = numerix.linspace(0.0, t_final, num_steps + 1)
+
+    for k in range(num_steps):
+        interval_start = float(t_edges[k])
+        interval_end   = float(t_edges[k + 1])
+
+        a_t = float(a_steps[k])
+
+        # stability-based dt (same as your generator logic)
+        # simple upper bound using 1 + |a_t|
+        Dmax_ref = D28x * (1.0 + abs(a_t))
+        Dmax_ref = max(Dmax_ref, 1e-20)
+        dt_base  = 0.25 * min(dx, dy)**2 / Dmax_ref
+
+        while t < interval_end - 1e-12:
+            dt = min(dt_base, interval_end - t)
+
+            # Isotropic, nonlinear D(φ)
+            Dx_phi = D28x * (1.0 + 5000.0 * a_t * phi**N_POLY)
+            Dy_phi = Dx_phi  # isotropic
+
+            gamma = CellVariable(
+                mesh=mesh,
+                rank=2,
+                value=((Dx_phi, 0 * phi),
+                       (0 * phi, Dy_phi))
+            )
+
+            eqn = TransientTerm() == DiffusionTerm(coeff=gamma)
+
+            phi.updateOld()
+            TOL = 1e-2
+            MAX_SWEEPS = 50
+
+            res = 1.0
+            for _ in range(MAX_SWEEPS):
+                res = eqn.sweep(var=phi, dt=dt)
+                if res <= TOL:
+                    break
+
+            t += dt
+
+    # final φ as numpy array [ny, nx]
+    phi_array = numerix.reshape(phi.value, (ny, nx))
+    phi_np = np.array(phi_array)
+    return phi_np
+
+
+# ============================================================
+# 2. Loss helper: Concentration MSE for a(t) profile
+# ============================================================
+
+def concentration_mse_for_profile(params, a_steps, phi_true,
+                                  nx_sim=64, ny_sim=64):
+    """
+    Given a parameter profile a_steps and ground-truth final field phi_true,
+    simulate the PDE and return the concentration MSE.
+    """
+    phi_hat = simulate_final_phi_isotropic(params, a_steps, nx=nx_sim, ny=ny_sim)
+    mse = float(np.mean((phi_hat - phi_true) ** 2))
+    return mse
+
+
+# ============================================================
+# 3. Static parameter calibration baseline
+#    a(t) = a_const for all time
+# ============================================================
+
+def calibrate_static_a(
+    params,
+    phi_true,
+    K,
+    theta_min=1.0,
+    theta_max=10.0,
+    nx_sim=64,
+    ny_sim=64,
+    num_iters=10,
+    lr=0.1,
+    grad_eps=1e-2,
+):
+    """
+    Static parameter calibration baseline:
+        a(t) = a_const  for all time intervals.
+
+    Optimize a_const via simple gradient descent with finite-difference
+    gradient approximation, minimizing concentration MSE at final time.
+    """
+
+    def loss_fn(a_val):
+        a_clamped = float(np.clip(a_val, theta_min, theta_max))
+        a_vec = np.full(K, a_clamped, dtype=float)
+        return concentration_mse_for_profile(params, a_vec, phi_true, nx_sim, ny_sim)
+
+    # Initialize at mid-range
+    a = 0.5 * (theta_min + theta_max)
+    best_a = a
+    best_loss = loss_fn(a)
+
+    for it in range(num_iters):
+        # Finite-difference gradient
+        loss_plus  = loss_fn(a + grad_eps)
+        loss_minus = loss_fn(a - grad_eps)
+        grad = (loss_plus - loss_minus) / (2.0 * grad_eps)
+
+        # Gradient descent update
+        a = a - lr * grad
+        a = float(np.clip(a, theta_min, theta_max))
+
+        loss_now = loss_fn(a)
+        if loss_now < best_loss:
+            best_loss = loss_now
+            best_a = a
+
+    return best_a, best_loss
+
+
+# ============================================================
+# 4. Linear functional parameter calibration baseline
+#    a_k = a0 + slope * τ_k, τ_k = k / (K-1)
+# ============================================================
+
+def build_linear_a_profile(a0, slope, K, theta_min=1.0, theta_max=10.0):
+    """
+    Construct a linear-in-time profile for a(t) over K intervals:
+        τ_k = k / (K - 1),  k = 0,...,K-1
+        a_k = a0 + slope * τ_k
+    Then clamp a_k to [theta_min, theta_max].
+    """
+    if K == 1:
+        t_norm = np.array([0.0], dtype=float)
+    else:
+        t_norm = np.linspace(0.0, 1.0, K, dtype=float)
+
+    a_vec = a0 + slope * t_norm
+    a_vec = np.clip(a_vec, theta_min, theta_max)
+    return a_vec
+
+
+def calibrate_linear_a(
+    params,
+    phi_true,
+    K,
+    theta_min=1.0,
+    theta_max=10.0,
+    nx_sim=64,
+    ny_sim=64,
+    num_iters=20,
+    lr=0.05,
+    grad_eps=1e-2,
+):
+    """
+    Prescribed linear functional parameter calibration baseline:
+
+        a_k = a0 + slope * τ_k,    τ_k = k / (K-1)
+
+    Optimize (a0, slope) via gradient descent with finite-difference
+    gradients to minimize concentration MSE at final time.
+    """
+
+    def loss_for_params(a0, slope):
+        a_vec = build_linear_a_profile(a0, slope, K, theta_min, theta_max)
+        return concentration_mse_for_profile(params, a_vec, phi_true, nx_sim, ny_sim)
+
+    # Initialize at mid-range with zero slope (same as static mid-range guess)
+    a0 = 0.5 * (theta_min + theta_max)
+    slope = 0.0
+
+    best_params = (a0, slope)
+    best_loss = loss_for_params(a0, slope)
+
+    for it in range(num_iters):
+        # Center loss (not strictly needed but handy for debugging)
+        loss_center = loss_for_params(a0, slope)
+
+        # Finite-difference gradients
+        # w.r.t a0
+        loss_A_plus  = loss_for_params(a0 + grad_eps, slope)
+        loss_A_minus = loss_for_params(a0 - grad_eps, slope)
+        grad_a0 = (loss_A_plus - loss_A_minus) / (2.0 * grad_eps)
+
+        # w.r.t slope
+        loss_s_plus  = loss_for_params(a0, slope + grad_eps)
+        loss_s_minus = loss_for_params(a0, slope - grad_eps)
+        grad_s = (loss_s_plus - loss_s_minus) / (2.0 * grad_eps)
+
+        # Gradient descent update
+        a0    = a0    - lr * grad_a0
+        slope = slope - lr * grad_s
+
+        # Clamp a0 into range; slope left unconstrained
+        a0 = float(np.clip(a0, theta_min, theta_max))
+
+        loss_now = loss_for_params(a0, slope)
+        if loss_now < best_loss:
+            best_loss = loss_now
+            best_params = (a0, slope)
+
+    return best_params, best_loss
+
+
+# ============================================================
+# 5. Running baselines on the validation split (lin-iso)
+# ============================================================
+
+def run_baselines_on_validation(
+    root_dir,
+    nx_sim=64,
+    ny_sim=64,
+    theta_min=1.0,
+    theta_max=10.0,
+):
+    """
+    Run both baselines (static and linear a(t)) on a validation split
+    of the dataset under root_dir.
+
+    Splitting strategy:
+        - All subfolders named 'sim_*' are collected and sorted.
+        - First 99.5% are treated as 'train' (ignored here).
+        - Remaining 0.5% are treated as 'validation'.
+    """
+    sim_dirs = sorted(
+        d for d in glob.glob(os.path.join(root_dir, "sim_*"))
+        if os.path.isdir(d)
+    )
+
+    if len(sim_dirs) == 0:
+        raise ValueError(f"No sim_* folders found under {root_dir}")
+
+    n_sims = len(sim_dirs)
+    n_train = int(0.995 * n_sims)
+    val_dirs = sim_dirs[n_train:]
+
+    print(f"Total simulations found: {n_sims}")
+    print(f"Using {len(val_dirs)} simulations for validation.\n")
+
+    static_mse_list = []
+    linear_mse_list = []
+
+    for sim_dir in val_dirs:
+        with open(os.path.join(sim_dir, "params.json"), "r") as f:
+            params = json.load(f)
+
+        # Ground-truth isotropic coefficients used in generator
+        a_true_array = np.array(params["coefficients_ax"], dtype=float)
+        K = len(a_true_array)
+
+        # Ground-truth final concentration field
+        phi_true = simulate_final_phi_isotropic(
+            params,
+            a_true_array,
+            nx=nx_sim,
+            ny=ny_sim,
+        )
+
+        # ---- Static calibration ----
+        a_const_opt, static_mse = calibrate_static_a(
+            params,
+            phi_true,
+            K,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            nx_sim=nx_sim,
+            ny_sim=ny_sim,
+        )
+
+        # ---- Linear functional calibration ----
+        (a0_opt, slope_opt), linear_mse = calibrate_linear_a(
+            params,
+            phi_true,
+            K,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            nx_sim=nx_sim,
+            ny_sim=ny_sim,
+        )
+
+        static_mse_list.append(static_mse)
+        linear_mse_list.append(linear_mse)
+
+        print(
+            f"[{os.path.basename(sim_dir)}] "
+            f"Static Conc MSE = {static_mse:.6e}, "
+            f"Linear Conc MSE = {linear_mse:.6e} "
+            f"(a_const={a_const_opt:.4f}, a0={a0_opt:.4f}, slope={slope_opt:.4f})"
+        )
+
+    static_mean = float(np.mean(static_mse_list)) if static_mse_list else float("nan")
+    linear_mean = float(np.mean(linear_mse_list)) if linear_mse_list else float("nan")
+
+    print("\n================ Overall Concentration MSE =================")
+    print(f"Static parameter calibration:   mean Conc MSE = {static_mean:.6e}")
+    print(f"Linear functional calibration:  mean Conc MSE = {linear_mean:.6e}")
+    print("===========================================================\n")
+
+    return static_mean, linear_mean
+
+
+# ============================================================
+# 6. Main entry point
+# ============================================================
+
+def main():
+    # TODO: set this to your linear-isotropic dataset root
+    root_dir = "/data/IMcali/sim_results_2025-12-17 22:31:04_lin_iso"  # adjust as needed
+
+    nx_sim = 64
+    ny_sim = 64
+
+    # Coefficient range used in your ML setup
+    theta_min = 1.0
+    theta_max = 10.0
+
+    run_baselines_on_validation(
+        root_dir=root_dir,
+        nx_sim=nx_sim,
+        ny_sim=ny_sim,
+        theta_min=theta_min,
+        theta_max=theta_max,
+    )
+
+
+if __name__ == "__main__":
+    main()
